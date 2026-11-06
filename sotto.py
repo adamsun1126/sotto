@@ -11,6 +11,9 @@ import sys
 import json
 import time
 import ctypes
+import queue
+import socket
+import re
 import threading
 import subprocess
 import urllib.request
@@ -33,6 +36,15 @@ CLEANUP     = os.environ.get("FLOW_CLEANUP", "1") == "1"       # 0 = raw transcr
 LANGS       = ("en", "zh")                                     # supported languages
 OLLAMA_URL  = "http://127.0.0.1:11434/api/chat"
 SAMPLE_RATE = 16000
+MIN_RMS     = 0.004     # below this the recording is treated as silence
+MAX_CLEANUP_CHARS = 6000  # longer transcripts are pasted raw (LLM context / latency)
+# Phrases Whisper hallucinates on silence or noise. Compared lowercase, punctuation stripped.
+HALLUCINATIONS = {
+    "thank you", "thanks for watching", "thank you for watching", "thanks for listening",
+    "subscribe", "please subscribe", "like and subscribe", "see you next time", "bye", "you",
+    "字幕由amara org社群提供", "字幕由amaraorg社群提供", "請不吝點贊訂閱轉發打賞支持明鏡與點點欄目",
+    "謝謝觀看", "謝謝收看", "謝謝大家", "明鏡與點點欄目", "字幕製作", "訂閱",
+}
 
 PROMPTS = {
     "en": {
@@ -141,18 +153,49 @@ def to_traditional(text):
         _cc = OpenCC("s2twp")
     return _cc.convert(text)
 
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+_PUNCT = re.compile(r"[\s\.,!?;:'\"\-\u3000-\u303f\uff00-\uffef]+")
+
+_HALLU_NORM = {_PUNCT.sub("", h.lower()) for h in HALLUCINATIONS}
+
+def is_hallucination(text):
+    norm = _PUNCT.sub("", text.lower())
+    return norm == "" or norm in _HALLU_NORM
+
 def transcribe(audio):
-    """Returns (text, language). Language is auto-detected; Chinese is normalised to Traditional."""
+    """Returns (text, language). Empty text means nothing usable was heard."""
     import mlx_whisper
+    if float(np.sqrt(np.mean(audio ** 2))) < MIN_RMS:
+        return "", LANG or "en"
     out = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER, language=LANG, verbose=None)
     lang = out.get("language") or LANG
-    if lang not in LANGS:   # e.g. Chinese misdetected as Japanese/Cantonese -> redo as Chinese
-        lang = "zh"
+    if lang not in LANGS:
+        # Misdetected (e.g. Chinese as Japanese/Cantonese, English as Dutch): pick by script and redo.
+        lang = "zh" if _CJK.search(out["text"]) else "en"
         out = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER, language=lang, verbose=None)
-    text = out["text"].strip()
+    # Whisper's own rule: a segment is silence only if no-speech is likely AND the decode was low-confidence.
+    segs = [sg for sg in out.get("segments", [])
+            if not (sg.get("no_speech_prob", 0) > 0.6 and sg.get("avg_logprob", 0) < -1.0)]
+    text = "".join(sg["text"] for sg in segs).strip() if out.get("segments") else out["text"].strip()
+    if is_hallucination(text):
+        return "", lang
     if lang == "zh":
         text = to_traditional(text)
     return text, lang
+
+def _tokens(text, lang):
+    t = _PUNCT.sub(" " if lang == "en" else "", text.lower())
+    return set(t.split()) if lang == "en" else set(t)
+
+def faithful(raw, cleaned, lang):
+    """True if `cleaned` is plausibly a tidied copy of `raw` rather than new content.
+    Guards against the LLM answering, obeying spoken 'instructions', or hallucinating."""
+    if not cleaned or len(cleaned) > 1.5 * len(raw) + 40:
+        return False
+    a, b = _tokens(raw, lang), _tokens(cleaned, lang)
+    if not b:
+        return False
+    return len(a & b) / len(b) >= 0.6   # most of the output must come from the input
 
 def cleanup(text, lang="en"):
     p = PROMPTS.get(lang, PROMPTS["en"])
@@ -162,19 +205,25 @@ def cleanup(text, lang="en"):
     messages.append({"role": "user", "content": text})
     body = json.dumps({
         "model": LLM, "stream": False, "think": False,
-        "options": {"temperature": 0.1}, "messages": messages,
+        "options": {"temperature": 0.1, "num_ctx": 8192}, "messages": messages,
     }).encode()
     req = urllib.request.Request(OLLAMA_URL, body, {"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=120) as r:
-        return json.load(r)["message"]["content"].strip()
+    with urllib.request.urlopen(req, timeout=90) as r:
+        out = json.load(r)["message"]["content"].strip()
+    return out.strip('"\u201c\u201d\u300c\u300d ').strip()
 
 # ---------- paste ----------
 def paste(text):
+    """Paste via the clipboard, then restore whatever text was on the clipboard before."""
+    previous = subprocess.run(["pbpaste"], capture_output=True).stdout
     subprocess.run(["pbcopy"], input=text.encode(), check=True)
     kb = keyboard.Controller()
     time.sleep(0.05)
     with kb.pressed(keyboard.Key.cmd):
         kb.press("v"); kb.release("v")
+    if previous:
+        time.sleep(0.3)   # let the target app read the clipboard first
+        subprocess.run(["pbcopy"], input=previous)
 
 # ---------- main flow ----------
 def process(audio):
@@ -185,9 +234,13 @@ def process(audio):
     if not raw:
         log("(nothing heard)"); return
     text = raw
-    if CLEANUP:
+    if CLEANUP and len(raw) <= MAX_CLEANUP_CHARS:
         try:
-            text = cleanup(raw, lang) or raw
+            cleaned = cleanup(raw, lang)
+            if faithful(raw, cleaned, lang):
+                text = cleaned
+            else:
+                log("(cleanup output did not match what was said; pasting raw transcript)")
         except Exception as e:
             log(f"cleanup failed, pasting raw transcript: {e}")
     paste(text)
@@ -212,38 +265,67 @@ def resolve_hotkey():
         sys.exit(1)
     return keyboard.KeyCode.from_char(HOTKEY)
 
+def single_instance():
+    """Hold a localhost port for the process lifetime so a second copy cannot paste twice."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 48217)); sock.listen(1)
+    except OSError:
+        log("sotto is already running in another window. Quit it first."); sys.exit(1)
+    return sock
+
+class App:
+    def __init__(self, key, recorder=None):
+        self.key = key
+        self.rec = recorder or Recorder()
+        self.jobs = queue.Queue()
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        while True:
+            audio = self.jobs.get()
+            try:
+                process(audio)
+            except Exception as e:
+                log(f"processing failed: {type(e).__name__}: {e}")
+            finally:
+                self.jobs.task_done()
+
+    def on_press(self, k):
+        if k != self.key or self.rec.stream is not None:
+            return
+        try:
+            self.rec.start()
+            pending = self.jobs.unfinished_tasks
+            log("* recording..." + (f" ({pending} queued)" if pending else ""))
+        except MicError as e:
+            log(f"Microphone unavailable: {e}. Check Microphone permission / other apps using the mic, then try again.")
+
+    def on_release(self, k):
+        if k != self.key or self.rec.stream is None:
+            return
+        try:
+            audio = self.rec.stop()
+        except Exception as e:   # device vanished mid-recording; never let this kill the listener
+            self.rec.stream = None
+            log(f"recording failed: {e}"); return
+        log("  processing...")
+        self.jobs.put(audio)
+
 def main():
     check_accessibility()
     key = resolve_hotkey()
-    rec = Recorder()
-    busy = threading.Event()
-
-    def on_press(k):
-        if k == key and not busy.is_set() and rec.stream is None:
-            try:
-                rec.start(); log("* recording...")
-            except MicError as e:
-                log(f"Microphone unavailable: {e}. Check Microphone permission / other apps using the mic, then try again.")
-
-    def on_release(k):
-        if k == key and rec.stream is not None:
-            audio = rec.stop()
-            log("  processing...")
-            def run():
-                busy.set()
-                try: process(audio)
-                finally: busy.clear()
-            threading.Thread(target=run, daemon=True).start()
-
+    _guard = single_instance()
     check_microphone()
     log("Loading models...")
-    transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32))
+    transcribe(np.full(SAMPLE_RATE, 0.01, dtype=np.float32))
     if CLEANUP:
         try: cleanup("test", "en")
         except Exception as e:
             log(f"WARNING: cannot reach Ollama ({e}). Transcripts will be pasted without cleanup. Start it with: ollama serve")
+    app = App(key)
     log(f"Ready. Hold [{HOTKEY.replace('_', ' ').title()}] to speak, release to paste. Ctrl+C to quit.")
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as l:
+    with keyboard.Listener(on_press=app.on_press, on_release=app.on_release) as l:
         l.join()
 
 if __name__ == "__main__":

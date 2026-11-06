@@ -9,3 +9,6 @@ dependencies = [
   "pynput",
   "opencc-python-reimplemented",
 ]
+
+[dependency-groups]
+dev = ["pytest"]

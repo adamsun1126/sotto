@@ -49,10 +49,22 @@ Environment variables:
 
 Example: `FLOW_HOTKEY=f13 FLOW_LLM=qwen2.5:3b ./run.sh`
 
+## Behaviour worth knowing
+- Silence, noise and Whisper's usual hallucinations ("Thank you.") are dropped, nothing is pasted.
+- The cleanup step is checked against what you actually said. If the model answers a
+  question, obeys an instruction you spoke, or invents text, the raw transcript is pasted instead.
+- You can start the next recording while the previous one is still processing; they are queued in order.
+- Your clipboard is restored after pasting (text only).
+- Only one instance can run at a time.
+
 ## Privacy
 No network calls except the one-time model downloads. No files written. No
-history. The only trace of what you said is the text pasted into your app and
-the system clipboard.
+history. The only trace of what you said is the text pasted into your app.
+
+## Tests
+```bash
+uv run pytest -q
+```
 
 ## Why another dictation tool?
 Wispr Flow, Superwhisper and macOS dictation are great, but they either send
