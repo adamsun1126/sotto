@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-flow.py - personal push-to-talk dictation, fully local, zero logging.
+sotto - personal push-to-talk dictation, fully local, zero logging.
 
 Hold a hotkey and speak -> release -> Whisper transcribes -> a local LLM cleans
 up the wording -> the text is pasted at the cursor. Audio lives only in memory;
