@@ -1,6 +1,5 @@
 #!/bin/zsh
-# Start Ollama if needed, then run sotto.
+# Run sotto (it starts Ollama itself if needed).
 export PATH=/opt/homebrew/bin:$PATH
 cd "$(dirname "$0")"
-pgrep -x ollama >/dev/null || (ollama serve >/dev/null 2>&1 &) && sleep 1
 exec uv run sotto.py "$@"

@@ -11,6 +11,7 @@ import sys
 import json
 import time
 import ctypes
+import shutil
 import queue
 import socket
 import re
@@ -197,6 +198,43 @@ def faithful(raw, cleaned, lang):
         return False
     return len(a & b) / len(b) >= 0.6   # most of the output must come from the input
 
+OLLAMA_BASE = OLLAMA_URL.rsplit("/api/", 1)[0]
+_ollama_proc = None
+
+def ollama_alive():
+    try:
+        with urllib.request.urlopen(OLLAMA_BASE + "/api/tags", timeout=2) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+def ensure_ollama():
+    """Start `ollama serve` if nothing answers, wait until it does, and check the model is pulled.
+    Returns True when cleanup can be used."""
+    global _ollama_proc
+    tags = ollama_alive()
+    if tags is None:
+        exe = shutil.which("ollama") or "/opt/homebrew/bin/ollama"
+        if not os.path.exists(exe):
+            log("WARNING: Ollama is not installed (brew install ollama). Transcripts will be pasted without cleanup.")
+            return False
+        log("Starting Ollama...")
+        _ollama_proc = subprocess.Popen([exe, "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                        start_new_session=True)
+        for _ in range(60):
+            time.sleep(0.5)
+            tags = ollama_alive()
+            if tags is not None:
+                break
+        else:
+            log("WARNING: Ollama did not start within 30 s. Transcripts will be pasted without cleanup.")
+            return False
+    names = {m["name"] for m in tags.get("models", [])}
+    if LLM not in names and LLM + ":latest" not in names:
+        log(f"WARNING: model {LLM} is not pulled. Run: ollama pull {LLM}. Transcripts will be pasted without cleanup.")
+        return False
+    return True
+
 def cleanup(text, lang="en"):
     p = PROMPTS.get(lang, PROMPTS["en"])
     messages = [{"role": "system", "content": p["system"]}]
@@ -226,6 +264,26 @@ def paste(text):
         subprocess.run(["pbcopy"], input=previous)
 
 # ---------- main flow ----------
+_ZH_PUNCT = str.maketrans({",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "："})
+
+def tidy_raw(text, lang):
+    """Minimal deterministic punctuation for transcripts that skip LLM cleanup."""
+    text = text.strip()
+    if not text:
+        return text
+    if lang == "zh":
+        # half-width marks between CJK characters -> full-width; never touch marks inside Latin runs (3.5, e.g.)
+        text = re.sub(r"(?<=[\u3400-\u9fff])[,.?!;:](?![0-9A-Za-z])|(?<![0-9])[,.?!;:](?=[\u3400-\u9fff])",
+                      lambda m: m.group(0).translate(_ZH_PUNCT), text)
+        text = re.sub(r"\s*([，。？！；：])\s*", r"\1", text)
+        if text[-1] not in "。？！…」』）":
+            text += "。"
+    else:
+        text = text[0].upper() + text[1:]
+        if text[-1] not in ".?!\"')":
+            text += "."
+    return text
+
 def process(audio):
     if audio is None or len(audio) < SAMPLE_RATE * 0.4:
         log("(too short, skipped)"); return
@@ -233,7 +291,7 @@ def process(audio):
     raw, lang = transcribe(audio)
     if not raw:
         log("(nothing heard)"); return
-    text = raw
+    text = None
     if CLEANUP and len(raw) <= MAX_CLEANUP_CHARS:
         try:
             cleaned = cleanup(raw, lang)
@@ -242,7 +300,11 @@ def process(audio):
             else:
                 log("(cleanup output did not match what was said; pasting raw transcript)")
         except Exception as e:
-            log(f"cleanup failed, pasting raw transcript: {e}")
+            log(f"(cleanup unavailable: {e}; pasting raw transcript. Is Ollama running?)")
+            if ollama_alive() is None:
+                ensure_ollama()   # try to bring it back for the next recording
+    if text is None:
+        text = tidy_raw(raw, lang)
     paste(text)
     log(f"OK {time.time()-t0:.1f}s [{lang}] {text}")
 
@@ -319,10 +381,10 @@ def main():
     check_microphone()
     log("Loading models...")
     transcribe(np.full(SAMPLE_RATE, 0.01, dtype=np.float32))
-    if CLEANUP:
-        try: cleanup("test", "en")
+    if CLEANUP and ensure_ollama():
+        try: cleanup("warm up", "en")
         except Exception as e:
-            log(f"WARNING: cannot reach Ollama ({e}). Transcripts will be pasted without cleanup. Start it with: ollama serve")
+            log(f"WARNING: Ollama answered but cleanup failed ({e}). Transcripts will be pasted without cleanup.")
     app = App(key)
     log(f"Ready. Hold [{HOTKEY.replace('_', ' ').title()}] to speak, release to paste. Ctrl+C to quit.")
     with keyboard.Listener(on_press=app.on_press, on_release=app.on_release) as l:

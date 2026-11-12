@@ -151,3 +151,32 @@ def test_ollama_down_falls_back_to_raw(no_real_paste, monkeypatch):
         pytest.skip("needs macOS say")
     sotto.process(tts("hello there"))
     assert no_real_paste and "hello" in no_real_paste[0].lower()
+
+
+@pytest.mark.parametrize("raw,lang,expected", [
+    ("我今天去了超市,買了牛奶然後回家煮飯", "zh", "我今天去了超市，買了牛奶然後回家煮飯。"),
+    ("這是 3.5 版的 API,沒問題嗎?", "zh", "這是 3.5 版的 API，沒問題嗎？"),
+    ("so revenue is up 12% but churn is also up", "en", "So revenue is up 12% but churn is also up."),
+    ("hi.", "en", "Hi."),
+    ("", "en", ""),
+])
+def test_tidy_raw_fallback_punctuation(raw, lang, expected):
+    assert sotto.tidy_raw(raw, lang) == expected
+
+
+def test_raw_path_is_tidied_when_ollama_is_down(no_real_paste, monkeypatch):
+    monkeypatch.setattr(sotto, "OLLAMA_URL", "http://127.0.0.1:1/api/chat")
+    monkeypatch.setattr(sotto, "OLLAMA_BASE", "http://127.0.0.1:1")
+    monkeypatch.setattr(sotto, "ensure_ollama", lambda: False)
+    monkeypatch.setattr(sotto, "transcribe", lambda a: ("我今天去了超市,買了牛奶", "zh"))
+    sotto.process(np.zeros(16000, np.float32) + 0.01)
+    assert no_real_paste == ["我今天去了超市，買了牛奶。"]
+
+
+@pytest.mark.skipif(not HAS_OLLAMA, reason="needs Ollama")
+def test_cleanup_adds_punctuation():
+    import re
+    out = sotto.cleanup("so I looked at the numbers this morning and revenue is up but churn is also up which worries me do you have time on Thursday", "en")
+    assert out.count(".") + out.count("?") >= 2
+    out = sotto.cleanup("我今天早上去了超市買了牛奶然後回家煮飯接著看了一部電影覺得還不錯", "zh")
+    assert len(re.findall("[，。]", out)) >= 2 and "," not in out

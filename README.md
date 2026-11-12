@@ -30,6 +30,7 @@ The Whisper model (~1.6 GB) downloads automatically on first run.
 ```bash
 ./run.sh
 ```
+sotto starts Ollama itself if it is not running and tells you if the model is missing.
 macOS asks for two permissions the first time: **Microphone** and
 **Accessibility** (System Settings > Privacy & Security > Accessibility: enable
 the terminal app you run this from). Grant both, then run again.
@@ -54,6 +55,8 @@ Example: `FLOW_HOTKEY=f13 FLOW_LLM=qwen2.5:3b ./run.sh`
 - The cleanup step is checked against what you actually said. If the model answers a
   question, obeys an instruction you spoke, or invents text, the raw transcript is pasted instead.
 - You can start the next recording while the previous one is still processing; they are queued in order.
+- If Ollama is unavailable the raw transcript is pasted with basic punctuation fixes
+  (full-width marks for Chinese, sentence end), and sotto tries to restart Ollama.
 - Your clipboard is restored after pasting (text only).
 - Only one instance can run at a time.
 
