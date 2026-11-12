@@ -98,9 +98,11 @@ def test_key_storms_and_recovery(monkeypatch):
 
 
 def test_single_instance():
-    guard = sotto.single_instance()
+    port = 48300 + os.getpid() % 1000          # not the real port: a running sotto must not affect the test
+    guard = sotto.single_instance(port)
     r = subprocess.run([sys.executable, "-c",
-                        "import sys; sys.path.insert(0, %r); import sotto; sotto.single_instance()" % os.path.dirname(sotto.__file__)],
+                        "import sys; sys.path.insert(0, %r); import sotto; sotto.single_instance(%d)"
+                        % (os.path.dirname(sotto.__file__), port)],
                        capture_output=True, text=True)
     guard.close()
     assert r.returncode == 1 and "already running" in r.stdout

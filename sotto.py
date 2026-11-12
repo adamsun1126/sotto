@@ -327,11 +327,13 @@ def resolve_hotkey():
         sys.exit(1)
     return keyboard.KeyCode.from_char(HOTKEY)
 
-def single_instance():
+LOCK_PORT = int(os.environ.get("FLOW_LOCK_PORT", "48217"))
+
+def single_instance(port=None):
     """Hold a localhost port for the process lifetime so a second copy cannot paste twice."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        sock.bind(("127.0.0.1", 48217)); sock.listen(1)
+        sock.bind(("127.0.0.1", port or LOCK_PORT)); sock.listen(1)
     except OSError:
         log("sotto is already running in another window. Quit it first."); sys.exit(1)
     return sock
