@@ -54,6 +54,9 @@ Example: `FLOW_HOTKEY=f13 FLOW_LLM=qwen2.5:3b ./run.sh`
 - Silence, noise and Whisper's usual hallucinations ("Thank you.") are dropped, nothing is pasted.
 - The cleanup step is checked against what you actually said. If the model answers a
   question, obeys an instruction you spoke, or invents text, the raw transcript is pasted instead.
+- Long dictations are transcribed and cleaned while you are still talking: every 12 to 28 seconds,
+  at a pause, the finished part is processed in the background. The wait after you release the key
+  stays at about 1 to 2 seconds whether you spoke for 5 seconds or 5 minutes.
 - You can start the next recording while the previous one is still processing; they are queued in order.
 - If Ollama is unavailable the raw transcript is pasted with basic punctuation fixes
   (full-width marks for Chinese, sentence end), and sotto tries to restart Ollama.

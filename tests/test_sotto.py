@@ -1,7 +1,7 @@
 """Edge-case tests. Run: uv run --with pytest pytest -q
 Uses macOS `say` to synthesise speech, so it only runs on macOS; tests needing
 Whisper/Ollama are skipped when those are unavailable."""
-import os, sys, wave, shutil, subprocess, tempfile, urllib.request
+import os, sys, time, wave, shutil, subprocess, tempfile, urllib.request
 import numpy as np
 import pytest
 
@@ -71,12 +71,12 @@ class FakeRec:
         self.stream = None
         if self.fail_stop:
             raise RuntimeError("device gone")
-        return np.zeros(100, np.float32)   # too short -> skipped, no model needed
+        return np.zeros(16000, np.float32)   # 1 s of silence; process() is mocked in these tests
 
 
 def test_key_storms_and_recovery(monkeypatch):
     processed = []
-    monkeypatch.setattr(sotto, "process", lambda a: processed.append(a))
+    monkeypatch.setattr(sotto, "process", lambda a, t0=None: processed.append(a))
     rec = FakeRec(); app = sotto.App("K", recorder=rec)
     app.on_press("X"); app.on_release("X"); app.on_release("K")      # other keys / stray release ignored
     assert rec.starts == 0
@@ -90,9 +90,9 @@ def test_key_storms_and_recovery(monkeypatch):
     rec.fail_stop = True; app.on_press("K"); app.on_release("K")      # stop() failure is contained
     assert rec.stream is None
     rec.fail_stop = False
-    monkeypatch.setattr(sotto, "process", lambda a: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(sotto, "process", lambda a, t0=None: (_ for _ in ()).throw(RuntimeError("boom")))
     app.on_press("K"); app.on_release("K"); app.jobs.join()           # worker survives a crash
-    monkeypatch.setattr(sotto, "process", lambda a: processed.append(a))
+    monkeypatch.setattr(sotto, "process", lambda a, t0=None: processed.append(a))
     app.on_press("K"); app.on_release("K"); app.jobs.join()
     assert len(processed) == 7
 
@@ -182,3 +182,41 @@ def test_cleanup_adds_punctuation():
     assert out.count(".") + out.count("?") >= 2
     out = sotto.cleanup("我今天早上去了超市買了牛奶然後回家煮飯接著看了一部電影覺得還不錯", "zh")
     assert len(re.findall("[，。]", out)) >= 2 and "," not in out
+
+
+def test_take_chunk_cuts_at_a_pause_and_keeps_the_rest():
+    rec = sotto.Recorder(); rec.rate = 16000; rec.stream = object()
+    rng = np.random.default_rng(0)
+    speech = lambda sec: (rng.standard_normal(int(sec * 16000)) * 0.1).astype(np.float32)
+    rec.frames = [speech(5).reshape(-1, 1)]
+    assert rec.take_chunk() is None                      # too early
+    rec.frames += [speech(9).reshape(-1, 1), np.zeros((8000, 1), np.float32), speech(2).reshape(-1, 1)]
+    chunk = rec.take_chunk()                             # 14 s speech, 0.5 s pause, 2 s speech
+    assert chunk is not None and 14 * 16000 < len(chunk) < 14.6 * 16000
+    rest = np.concatenate(rec.frames)[:, 0]
+    assert len(chunk) + len(rest) == 16.5 * 16000        # nothing lost
+    assert rec.take_chunk() is None                      # remainder is short again
+    rec.frames += [speech(30).reshape(-1, 1)]            # no pause at all: forced cut after CHUNK_MAX
+    assert rec.take_chunk() is not None
+
+
+def test_join_parts():
+    assert sotto.join_parts([("Hello.", "en"), ("Bye.", "en")]) == "Hello. Bye."
+    assert sotto.join_parts([("你好。", "zh"), ("再見。", "zh")]) == "你好。再見。"
+    assert sotto.join_parts([("你好。", "zh"), ("", "zh"), ("ok.", "en")]) == "你好。 ok."
+    assert sotto.join_parts([("", "en")]) == ""
+
+
+@pytest.mark.skipif(not (HAS_SAY and HAS_OLLAMA), reason="needs say + Ollama")
+def test_chunks_prepared_during_recording_are_pasted_in_order(no_real_paste):
+    class ChunkRec(FakeRec):
+        def __init__(self):
+            super().__init__(); self.chunks = [tts("first part of the sentence"), tts("second part of the sentence")]
+        def take_chunk(self):
+            return self.chunks.pop(0) if self.chunks else None
+        def stop(self):
+            self.stream = None; return tts("and the end")
+    app = sotto.App("K", recorder=ChunkRec())
+    app.on_press("K"); time.sleep(1.0); app.on_release("K"); app.jobs.join()
+    out = no_real_paste[-1].lower()
+    assert out.index("first") < out.index("second") < out.index("end")

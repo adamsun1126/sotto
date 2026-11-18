@@ -16,6 +16,7 @@ import queue
 import socket
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import subprocess
 import urllib.request
 
@@ -38,6 +39,9 @@ LANGS       = ("en", "zh")                                     # supported langu
 OLLAMA_URL  = "http://127.0.0.1:11434/api/chat"
 SAMPLE_RATE = 16000
 MIN_RMS     = 0.004     # below this the recording is treated as silence
+CHUNK_MIN   = 12        # seconds of speech before a pause may close a chunk
+CHUNK_MAX   = 28        # seconds after which a chunk is closed at the quietest point
+PAUSE_RMS   = 0.006     # a 50 ms window below this counts as a pause
 MAX_CLEANUP_CHARS = 6000  # longer transcripts are pasted raw (LLM context / latency)
 # Phrases Whisper hallucinates on silence or noise. Compared lowercase, punctuation stripped.
 HALLUCINATIONS = {
@@ -96,21 +100,66 @@ class Recorder:
         self.stream = None
         self.rate = SAMPLE_RATE
         self.lock = threading.Lock()
+        self.flock = threading.Lock()   # guards self.frames (appended from the audio thread)
 
     def _open(self):
         dev = sd.query_devices(kind="input")
         self.rate = int(dev["default_samplerate"]) or SAMPLE_RATE
         stream = sd.InputStream(
             samplerate=self.rate, channels=1, dtype="float32",
-            callback=lambda indata, *_: self.frames.append(indata.copy()))
+            callback=self._on_audio)
         stream.start()
         return stream
+
+    def _on_audio(self, indata, *_):
+        with self.flock:
+            self.frames.append(indata.copy())
+
+    def _take_frames(self):
+        with self.flock:
+            frames, self.frames = self.frames, []
+        return np.concatenate(frames)[:, 0] if frames else None
+
+    def _to_16k(self, audio):
+        if self.rate == SAMPLE_RATE:
+            return audio.astype(np.float32)
+        n = int(len(audio) * SAMPLE_RATE / self.rate)
+        return np.interp(np.linspace(0, len(audio) - 1, n), np.arange(len(audio)), audio).astype(np.float32)
+
+    def take_chunk(self):
+        """While recording: returns the audio so far (16 kHz) up to a pause once CHUNK_MIN seconds
+        are in, or up to the quietest point once CHUNK_MAX seconds are in. Else None."""
+        with self.lock:
+            if not self.stream:
+                return None
+            audio = self._take_frames()
+            if audio is None or len(audio) < CHUNK_MIN * self.rate:
+                self._put_back(audio); return None
+            win = int(0.05 * self.rate)
+            start = CHUNK_MIN * self.rate
+            tail = audio[start:len(audio) // win * win]
+            rms = np.sqrt((tail.reshape(-1, win) ** 2).mean(axis=1))
+            quiet = np.flatnonzero(rms < PAUSE_RMS)
+            if len(quiet):
+                cut = start + int(quiet[-1]) * win + win // 2
+            elif len(audio) >= CHUNK_MAX * self.rate:
+                cut = start + int(rms.argmin()) * win + win // 2
+            else:
+                self._put_back(audio); return None
+            self._put_back(audio[cut:])
+            return self._to_16k(audio[:cut])
+
+    def _put_back(self, audio):
+        if audio is not None and len(audio):
+            with self.flock:
+                self.frames.insert(0, audio.reshape(-1, 1))
 
     def start(self):
         with self.lock:
             if self.stream:
                 return
-            self.frames = []
+            with self.flock:
+                self.frames = []
             try:
                 self.stream = self._open()
             except Exception:
@@ -126,13 +175,8 @@ class Recorder:
             if not self.stream:
                 return None
             self.stream.stop(); self.stream.close(); self.stream = None
-            if not self.frames:
-                return None
-            audio = np.concatenate(self.frames)[:, 0]
-            if self.rate != SAMPLE_RATE:
-                n = int(len(audio) * SAMPLE_RATE / self.rate)
-                audio = np.interp(np.linspace(0, len(audio) - 1, n), np.arange(len(audio)), audio).astype(np.float32)
-            return audio
+            audio = self._take_frames()
+            return None if audio is None else self._to_16k(audio)
 
 def check_microphone():
     try:
@@ -248,6 +292,7 @@ def cleanup(text, lang="en"):
     req = urllib.request.Request(OLLAMA_URL, body, {"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=90) as r:
         out = json.load(r)["message"]["content"].strip()
+    out = re.sub(r"\s*\n\s*", " " if lang == "en" else "", out)   # one paragraph per dictation
     return out.strip('"\u201c\u201d\u300c\u300d ').strip()
 
 # ---------- paste ----------
@@ -284,13 +329,11 @@ def tidy_raw(text, lang):
             text += "."
     return text
 
-def process(audio):
-    if audio is None or len(audio) < SAMPLE_RATE * 0.4:
-        log("(too short, skipped)"); return
-    t0 = time.time()
+def prepare(audio):
+    """Transcribe and tidy one piece of audio. Returns (text, lang); text is "" if nothing was heard."""
     raw, lang = transcribe(audio)
     if not raw:
-        log("(nothing heard)"); return
+        return "", lang
     text = None
     if CLEANUP and len(raw) <= MAX_CLEANUP_CHARS:
         try:
@@ -305,8 +348,36 @@ def process(audio):
                 ensure_ollama()   # try to bring it back for the next recording
     if text is None:
         text = tidy_raw(raw, lang)
+    return text, lang
+
+def join_parts(parts):
+    out, prev = "", None
+    for text, lang in parts:
+        if not text:
+            continue
+        if out and (lang == "en" or prev == "en"):
+            out += " "
+        out += text; prev = lang
+    return out
+
+def process(job, t0=None):
+    """job: one audio array, or a list of futures from prepare() for the chunks of one recording."""
+    t0 = t0 or time.time()
+    if not isinstance(job, list):
+        if job is None or len(job) < SAMPLE_RATE * 0.4:
+            log("(too short, skipped)"); return
+        job = [_done(prepare(job))]
+    parts = [f.result() for f in job]
+    text = join_parts(parts)
+    if not text:
+        log("(nothing heard)"); return
     paste(text)
+    lang = parts[-1][1]
     log(f"OK {time.time()-t0:.1f}s [{lang}] {text}")
+
+class _done:
+    def __init__(self, value): self.value = value
+    def result(self): return self.value
 
 def check_accessibility():
     ax = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
@@ -343,13 +414,16 @@ class App:
         self.key = key
         self.rec = recorder or Recorder()
         self.jobs = queue.Queue()
+        self.pool = ThreadPoolExecutor(max_workers=1)   # transcribes chunks while you are still talking
+        self.parts = []                                 # futures for the current recording
+        self.plock = threading.Lock()
         threading.Thread(target=self._worker, daemon=True).start()
 
     def _worker(self):
         while True:
-            audio = self.jobs.get()
+            job, t0 = self.jobs.get()
             try:
-                process(audio)
+                process(job, t0)
             except Exception as e:
                 log(f"processing failed: {type(e).__name__}: {e}")
             finally:
@@ -360,6 +434,8 @@ class App:
             return
         try:
             self.rec.start()
+            self.parts = []
+            threading.Thread(target=self._chunker, daemon=True).start()
             pending = self.jobs.unfinished_tasks
             log("* recording..." + (f" ({pending} queued)" if pending else ""))
         except MicError as e:
@@ -368,13 +444,32 @@ class App:
     def on_release(self, k):
         if k != self.key or self.rec.stream is None:
             return
-        try:
-            audio = self.rec.stop()
-        except Exception as e:   # device vanished mid-recording; never let this kill the listener
-            self.rec.stream = None
-            log(f"recording failed: {e}"); return
+        t0 = time.time()
+        with self.plock:
+            try:
+                audio = self.rec.stop()
+            except Exception as e:   # device vanished mid-recording; never let this kill the listener
+                self.rec.stream = None
+                log(f"recording failed: {e}"); return
+            parts, self.parts = self.parts, []
+        if not parts and (audio is None or len(audio) < SAMPLE_RATE * 0.4):
+            log("(too short, skipped)"); return
+        if audio is not None and (len(audio) >= SAMPLE_RATE * 0.4 or not parts):
+            parts.append(self.pool.submit(prepare, audio))
         log("  processing...")
-        self.jobs.put(audio)
+        self.jobs.put((parts, t0))
+
+    def _chunker(self):
+        """Runs while recording: hands finished chunks to the pool so most of the work is done at release."""
+        take = getattr(self.rec, "take_chunk", None)
+        while take and self.rec.stream is not None:
+            time.sleep(0.25)
+            with self.plock:
+                if self.rec.stream is None:
+                    return
+                chunk = take()
+                if chunk is not None:
+                    self.parts.append(self.pool.submit(prepare, chunk))
 
 def main():
     check_accessibility()
