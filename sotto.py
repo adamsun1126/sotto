@@ -42,13 +42,16 @@ MIN_RMS     = 0.004     # below this the recording is treated as silence
 CHUNK_MIN   = 12        # seconds of speech before a pause may close a chunk
 CHUNK_MAX   = 28        # seconds after which a chunk is closed at the quietest point
 PAUSE_RMS   = 0.006     # a 50 ms window below this counts as a pause
+KEEP_WARM   = int(os.environ.get("FLOW_KEEP_WARM", "45"))   # seconds between idle warm-ups; 0 = off
 MAX_CLEANUP_CHARS = 6000  # longer transcripts are pasted raw (LLM context / latency)
 # Phrases Whisper hallucinates on silence or noise. Compared lowercase, punctuation stripped.
 HALLUCINATIONS = {
     "thank you", "thanks for watching", "thank you for watching", "thanks for listening",
     "subscribe", "please subscribe", "like and subscribe", "see you next time", "bye", "you",
     "字幕由amara org社群提供", "字幕由amaraorg社群提供", "請不吝點贊訂閱轉發打賞支持明鏡與點點欄目",
+    "請不吝點贊訂閱轉發打賞支援明鏡與點點欄目",
     "謝謝觀看", "謝謝收看", "謝謝大家", "明鏡與點點欄目", "字幕製作", "訂閱",
+    "優優獨播劇場yoyotelevisionseriesexclusive", "優優獨播劇場", "yoyotelevisionseriesexclusive",
 }
 
 PROMPTS = {
@@ -199,7 +202,7 @@ def to_traditional(text):
     return _cc.convert(text)
 
 _CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
-_PUNCT = re.compile(r"[\s\.,!?;:'\"\-\u3000-\u303f\uff00-\uffef]+")
+_PUNCT = re.compile(r"[\s\.,!?;:'\"\-\u2010-\u2027\u3000-\u303f\uff00-\uffef]+")
 
 _HALLU_NORM = {_PUNCT.sub("", h.lower()) for h in HALLUCINATIONS}
 
@@ -219,9 +222,13 @@ def transcribe(audio):
         lang = "zh" if _CJK.search(out["text"]) else "en"
         out = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER, language=lang, verbose=None)
     # Whisper's own rule: a segment is silence only if no-speech is likely AND the decode was low-confidence.
+    # ... and a decode that bad (noise turned into random words) is never speech.
     segs = [sg for sg in out.get("segments", [])
-            if not (sg.get("no_speech_prob", 0) > 0.6 and sg.get("avg_logprob", 0) < -1.0)]
+            if not (sg.get("no_speech_prob", 0) > 0.6 and sg.get("avg_logprob", 0) < -1.0)
+            and sg.get("avg_logprob", 0) > -2.0]
     text = "".join(sg["text"] for sg in segs).strip() if out.get("segments") else out["text"].strip()
+    import mlx.core as mx
+    mx.clear_cache()   # drop MLX's scratch buffers so less of this process can be swapped out while idle
     if is_hallucination(text):
         return "", lang
     if lang == "zh":
@@ -304,9 +311,8 @@ def paste(text):
     time.sleep(0.05)
     with kb.pressed(keyboard.Key.cmd):
         kb.press("v"); kb.release("v")
-    if previous:
-        time.sleep(0.3)   # let the target app read the clipboard first
-        subprocess.run(["pbcopy"], input=previous)
+    if previous:   # restore in the background once the target app has read the clipboard
+        threading.Timer(0.3, lambda: subprocess.run(["pbcopy"], input=previous)).start()
 
 # ---------- main flow ----------
 _ZH_PUNCT = str.maketrans({",": "，", ".": "。", "?": "？", "!": "！", ";": "；", ":": "："})
@@ -331,10 +337,13 @@ def tidy_raw(text, lang):
 
 def prepare(audio):
     """Transcribe and tidy one piece of audio. Returns (text, lang); text is "" if nothing was heard."""
+    t = time.time()
     raw, lang = transcribe(audio)
+    took = {"whisper": time.time() - t, "llm": 0.0}
     if not raw:
-        return "", lang
+        return "", lang, took
     text = None
+    t = time.time()
     if CLEANUP and len(raw) <= MAX_CLEANUP_CHARS:
         try:
             cleaned = cleanup(raw, lang)
@@ -346,13 +355,14 @@ def prepare(audio):
             log(f"(cleanup unavailable: {e}; pasting raw transcript. Is Ollama running?)")
             if ollama_alive() is None:
                 ensure_ollama()   # try to bring it back for the next recording
+    took["llm"] = time.time() - t
     if text is None:
         text = tidy_raw(raw, lang)
-    return text, lang
+    return text, lang, took
 
 def join_parts(parts):
     out, prev = "", None
-    for text, lang in parts:
+    for text, lang, *_ in parts:
         if not text:
             continue
         if out and (lang == "en" or prev == "en"):
@@ -371,13 +381,20 @@ def process(job, t0=None):
     text = join_parts(parts)
     if not text:
         log("(nothing heard)"); return
-    paste(text)
+    t = time.time(); paste(text); tp = time.time() - t
     lang = parts[-1][1]
-    log(f"OK {time.time()-t0:.1f}s [{lang}] {text}")
+    tw = sum(p[2]["whisper"] for p in parts if len(p) > 2)
+    tl = sum(p[2]["llm"] for p in parts if len(p) > 2)
+    log(f"OK {time.time()-t0:.1f}s (whisper {tw:.1f} + cleanup {tl:.1f} + paste {tp:.1f}) [{lang}] {text}")
 
 class _done:
     def __init__(self, value): self.value = value
     def result(self): return self.value
+
+def warm():
+    transcribe(np.full(SAMPLE_RATE // 2, 0.01, dtype=np.float32))
+    if CLEANUP:
+        cleanup("warm up", "en")
 
 def check_accessibility():
     ax = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
@@ -417,7 +434,23 @@ class App:
         self.pool = ThreadPoolExecutor(max_workers=1)   # transcribes chunks while you are still talking
         self.parts = []                                 # futures for the current recording
         self.plock = threading.Lock()
+        self.last_use = time.time()
         threading.Thread(target=self._worker, daemon=True).start()
+        if KEEP_WARM > 0:
+            threading.Thread(target=self._keep_warm, daemon=True).start()
+
+    def _keep_warm(self):
+        """Touch both models while idle so macOS does not swap them out: a dictation after a few
+        idle minutes otherwise pays 2-5 s to page the weights back in."""
+        while True:
+            time.sleep(5)
+            if self.rec.stream is not None or self.jobs.unfinished_tasks or time.time() - self.last_use < KEEP_WARM:
+                continue
+            self.last_use = time.time()
+            try:
+                self.pool.submit(warm).result()
+            except Exception:
+                pass
 
     def _worker(self):
         while True:
@@ -435,6 +468,7 @@ class App:
         try:
             self.rec.start()
             self.parts = []
+            self.last_use = time.time()
             threading.Thread(target=self._chunker, daemon=True).start()
             pending = self.jobs.unfinished_tasks
             log("* recording..." + (f" ({pending} queued)" if pending else ""))
@@ -457,6 +491,7 @@ class App:
         if audio is not None and (len(audio) >= SAMPLE_RATE * 0.4 or not parts):
             parts.append(self.pool.submit(prepare, audio))
         log("  processing...")
+        self.last_use = time.time()
         self.jobs.put((parts, t0))
 
     def _chunker(self):
@@ -482,6 +517,8 @@ def main():
         try: cleanup("warm up", "en")
         except Exception as e:
             log(f"WARNING: Ollama answered but cleanup failed ({e}). Transcripts will be pasted without cleanup.")
+    log("Memory: a dictation after a long idle is slower when this Mac is low on memory (swapping);"
+        " sotto touches the models every %ds to keep them loaded (FLOW_KEEP_WARM=0 to disable)." % KEEP_WARM)
     app = App(key)
     log(f"Ready. Hold [{HOTKEY.replace('_', ' ').title()}] to speak, release to paste. Ctrl+C to quit.")
     with keyboard.Listener(on_press=app.on_press, on_release=app.on_release) as l:

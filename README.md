@@ -47,6 +47,7 @@ Environment variables:
 | `FLOW_WHISPER` | `mlx-community/whisper-large-v3-turbo` | Whisper model (`mlx-community/whisper-small-mlx` is faster) |
 | `FLOW_LANG` | auto | Force `zh` or `en`. Auto-detect handles mixed Chinese/English |
 | `FLOW_CLEANUP` | `1` | `0` pastes the raw transcript without LLM cleanup |
+| `FLOW_KEEP_WARM` | `45` | Seconds between idle warm-ups that keep both models in memory. `0` disables. |
 
 Example: `FLOW_HOTKEY=f13 FLOW_LLM=qwen2.5:3b ./run.sh`
 
@@ -60,6 +61,10 @@ Example: `FLOW_HOTKEY=f13 FLOW_LLM=qwen2.5:3b ./run.sh`
 - You can start the next recording while the previous one is still processing; they are queued in order.
 - If Ollama is unavailable the raw transcript is pasted with basic punctuation fixes
   (full-width marks for Chinese, sentence end), and sotto tries to restart Ollama.
+- When the Mac is low on memory, macOS swaps idle models out and the next dictation pays 2 to 5 seconds
+  to page them back in. sotto touches both models every 45 seconds while idle to prevent that
+  (about 0.2 s of GPU time a minute; `FLOW_KEEP_WARM=0` turns it off). A smaller cleanup model
+  (`FLOW_LLM=qwen2.5:3b`) also helps on a crowded machine.
 - Your clipboard is restored after pasting (text only).
 - Only one instance can run at a time.
 
