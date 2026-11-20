@@ -210,29 +210,104 @@ def is_hallucination(text):
     norm = _PUNCT.sub("", text.lower())
     return norm == "" or norm in _HALLU_NORM
 
-def transcribe(audio):
-    """Returns (text, language). Empty text means nothing usable was heard."""
+def _confidence(out, worst=False):
+    lps = [sg.get("avg_logprob", 0) for sg in out.get("segments") or []]
+    return float(min(lps) if worst else np.mean(lps)) if lps else -99.0
+
+def _decode(audio, language):
     import mlx_whisper
-    if float(np.sqrt(np.mean(audio ** 2))) < MIN_RMS:
-        return "", LANG or "en"
-    out = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER, language=LANG, verbose=None)
+    # word_timestamps: segment times are otherwise rounded to the whole window, which hides dropped speech.
+    return mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER, language=language, verbose=None,
+                                  word_timestamps=True)
+
+def _decode_auto(audio):
+    """Decode one piece of audio, choosing between en and zh. Returns (whisper result, lang)."""
+    out = _decode(audio, LANG)
     lang = out.get("language") or LANG
     if lang not in LANGS:
         # Misdetected (e.g. Chinese as Japanese/Cantonese, English as Dutch): pick by script and redo.
         lang = "zh" if _CJK.search(out["text"]) else "en"
-        out = mlx_whisper.transcribe(audio, path_or_hf_repo=WHISPER, language=lang, verbose=None)
+        out = _decode(audio, lang)
+    if not LANG and _confidence(out, worst=True) < -1.5:
+        # Whisper picked the wrong language (English decoded as Chinese comes out as a "translation"
+        # or garbage): decode in the other one and keep whichever it was surer about.
+        other = "en" if lang == "zh" else "zh"
+        alt = _decode(audio, other)
+        if _confidence(alt) > _confidence(out):
+            out, lang = alt, other
+    return out, lang
+
+def _segments(out):
     # Whisper's own rule: a segment is silence only if no-speech is likely AND the decode was low-confidence.
     # ... and a decode that bad (noise turned into random words) is never speech.
-    segs = [sg for sg in out.get("segments", [])
+    return [sg for sg in out.get("segments", [])
             if not (sg.get("no_speech_prob", 0) > 0.6 and sg.get("avg_logprob", 0) < -1.0)
             and sg.get("avg_logprob", 0) > -2.0]
+
+def _pieces(out, lang, offset=0):
+    """(start_sample, text, lang) per kept segment; nothing if the whole thing is a hallucination."""
+    segs = _segments(out)
     text = "".join(sg["text"] for sg in segs).strip() if out.get("segments") else out["text"].strip()
+    if is_hallucination(text):
+        return []
+    tw = lambda t: to_traditional(t) if _CJK.search(t) else t   # an English decode can still carry Chinese
+    if not segs:
+        return [(offset, tw(text), lang)]
+    return [(offset + int(sg["start"] * SAMPLE_RATE), tw(sg["text"].strip()), lang,
+             offset + int(sg["end"] * SAMPLE_RATE)) for sg in segs]
+
+def _uncovered(audio, out, min_seconds=0.8, margin=0.25):
+    """Spans of audio with speech energy that no decoded segment covers, as (start, end) samples.
+    Whisper decoding in one language silently drops a sentence spoken in the other."""
+    win = SAMPLE_RATE // 20
+    n = len(audio) // win
+    if n == 0:
+        return []
+    speech = np.sqrt((audio[:n * win].reshape(n, win) ** 2).mean(axis=1)) > PAUSE_RMS
+    for sg in out.get("segments", []):
+        a = max(0, int(sg["start"] * 20)); b = min(n, int(np.ceil((sg["end"] + margin) * 20)))
+        speech[a:b] = False
+    spans, i = [], 0
+    while i < n:
+        if speech[i]:
+            j = i
+            while j < n and (speech[j] or speech[j:j + 6].any()):   # bridge pauses under 300 ms
+                j += 1
+            if j - i >= min_seconds * 20:
+                # alignment at the join is loose: overlap the neighbour a little rather than lose a word
+                spans.append((max(0, (i - 2) * win), min(len(audio), (j + 8) * win)))
+            i = j
+        i += 1
+    return spans
+
+def _mostly_inside(piece, ranges):
+    if len(piece) < 4 or piece[3] <= piece[0]:
+        return False
+    inside = sum(max(0, min(piece[3], b) - max(piece[0], a)) for a, b in ranges)
+    return inside > 0.5 * (piece[3] - piece[0])
+
+def transcribe(audio):
+    """Returns (text, language). Empty text means nothing usable was heard."""
+    if float(np.sqrt(np.mean(audio ** 2))) < MIN_RMS:
+        return "", LANG or "en"
+    out, lang = _decode_auto(audio)
+    pieces = _pieces(out, lang)
+    if not LANG:
+        extra, main = [], [(p[0], p[3]) for p in pieces if len(p) > 3]
+        for a, b in _uncovered(audio, out):
+            o, l = _decode_auto(audio[a:b])
+            # a piece that mostly sits inside the other decode's time range is a rendering of the same
+            # speech in the wrong language (or of the overlap at the join): keep the other decode's.
+            extra += [p for p in _pieces(o, l, offset=a) if not _mostly_inside(p, main)]
+            pieces = [p for p in pieces if not _mostly_inside(p, [(a, b)])]
+        pieces += extra
     import mlx.core as mx
     mx.clear_cache()   # drop MLX's scratch buffers so less of this process can be swapped out while idle
-    if is_hallucination(text):
-        return "", lang
-    if lang == "zh":
-        text = to_traditional(text)
+    pieces.sort(key=lambda p: p[0])
+    text = join_parts([(p[1], p[2]) for p in pieces])
+    if text and len({p[2] for p in pieces}) > 1:
+        by_lang = {l: sum(len(p[1]) for p in pieces if p[2] == l) for l in LANGS}
+        lang = max(by_lang, key=by_lang.get)   # the language with more characters picks the cleanup prompt
     return text, lang
 
 def _tokens(text, lang):

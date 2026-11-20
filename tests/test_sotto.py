@@ -220,3 +220,23 @@ def test_chunks_prepared_during_recording_are_pasted_in_order(no_real_paste):
     app.on_press("K"); time.sleep(1.0); app.on_release("K"); app.jobs.join()
     out = no_real_paste[-1].lower()
     assert out.index("first") < out.index("second") < out.index("end")
+
+
+@pytest.mark.skipif(not HAS_SAY, reason="needs macOS say")
+def test_english_after_chinese_is_not_turned_into_chinese():
+    audio = np.concatenate([tts("can you make the header a bit darker and move the button to the left"),
+                            tts("這個先不管", "Meijia")])
+    raw, lang = sotto.transcribe(audio)
+    assert lang == "en" and "header" in raw.lower(), raw
+    assert "顶" not in raw and "頂" not in raw
+
+
+@pytest.mark.skipif(not HAS_SAY, reason="needs macOS say")
+def test_sentences_in_both_languages_keep_their_order():
+    en, zh, en2 = tts("can you make the header a bit darker"), tts("這個先不管", "Meijia"), tts("let's ship it on friday")
+    text, _ = sotto.transcribe(np.concatenate([en, zh, en2]))
+    low = text.lower()
+    assert "header" in low and "這個先不管" in text and "friday" in low, text
+    assert low.index("header") < text.index("這個先不管") < low.index("friday")
+    text, _ = sotto.transcribe(np.concatenate([en2, tts("然後記得通知大家", "Meijia")]))
+    assert text.lower().count("friday") == 1 and "yeah" not in text.lower(), text
